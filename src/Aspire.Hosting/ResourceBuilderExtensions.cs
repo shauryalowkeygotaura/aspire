@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 #pragma warning disable ASPIREPERSISTENCE001 // Persistence annotation APIs are experimental.
+#pragma warning disable ASPIREEXTENSION001 // Debug support annotations are experimental.
 
 using System.Diagnostics.CodeAnalysis;
 using System.Net.Http.Headers;
@@ -10,6 +11,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.Json.Serialization;
 using Aspire.Dashboard.Model;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Ats;
@@ -691,6 +693,65 @@ public static class ResourceBuilderExtensions
     }
 
     /// <summary>
+    /// Stores serialized integration metadata on a resource.
+    /// </summary>
+    /// <typeparam name="T">The resource type.</typeparam>
+    /// <param name="builder">The resource builder.</param>
+    /// <param name="name">The integration-scoped metadata name.</param>
+    /// <param name="value">The serialized metadata value.</param>
+    /// <returns>The resource builder.</returns>
+    /// <ats-returns>The resource builder.</ats-returns>
+    [AspireExport]
+    internal static IResourceBuilder<T> WithIntegrationMetadata<T>(this IResourceBuilder<T> builder, string name, string value)
+        where T : IResource
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(value);
+
+        RemoveIntegrationMetadata(builder.Resource, name);
+        builder.Resource.Annotations.Add(new IntegrationMetadataAnnotation(name, value));
+
+        return builder;
+    }
+
+    /// <summary>
+    /// Gets serialized integration metadata from a resource builder.
+    /// </summary>
+    /// <typeparam name="T">The resource type.</typeparam>
+    /// <param name="builder">The resource builder.</param>
+    /// <param name="name">The integration-scoped metadata name.</param>
+    /// <returns>The serialized metadata value.</returns>
+    [AspireExport("getBuilderIntegrationMetadata", MethodName = "getIntegrationMetadata")]
+    internal static string GetIntegrationMetadata<T>(this IResourceBuilder<T> builder, string name)
+        where T : IResource
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        return GetIntegrationMetadata(builder.Resource, name);
+    }
+
+    /// <summary>
+    /// Gets serialized integration metadata from a resource.
+    /// </summary>
+    /// <param name="resource">The resource.</param>
+    /// <param name="name">The integration-scoped metadata name.</param>
+    /// <returns>The serialized metadata value.</returns>
+    [AspireExport("getResourceIntegrationMetadata", MethodName = "getIntegrationMetadata")]
+    internal static string GetIntegrationMetadata(this IResource resource, string name)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        return resource.Annotations
+            .OfType<IntegrationMetadataAnnotation>()
+            .LastOrDefault(annotation => string.Equals(annotation.Name, name, StringComparison.Ordinal))
+            ?.Value
+            ?? throw new InvalidOperationException($"Resource '{resource.Name}' does not contain integration metadata named '{name}'.");
+    }
+
+    /// <summary>
     /// Replaces the arguments to be passed to a resource that supports arguments when it is launched.
     /// </summary>
     /// <typeparam name="T">The resource type.</typeparam>
@@ -709,6 +770,19 @@ public static class ResourceBuilderExtensions
             context.Args.Clear();
             context.Args.AddRange(args);
         });
+    }
+
+    private static void RemoveIntegrationMetadata(IResource resource, string name)
+    {
+        var existingAnnotations = resource.Annotations
+            .OfType<IntegrationMetadataAnnotation>()
+            .Where(annotation => string.Equals(annotation.Name, name, StringComparison.Ordinal))
+            .ToArray();
+
+        foreach (var annotation in existingAnnotations)
+        {
+            resource.Annotations.Remove(annotation);
+        }
     }
 
     /// <summary>
@@ -4172,6 +4246,43 @@ public static class ResourceBuilderExtensions
     }
 
     /// <summary>
+    /// Configures environment variables that point to Aspire-managed certificate trust paths.
+    /// </summary>
+    /// <typeparam name="TResource">The type of the resource.</typeparam>
+    /// <param name="builder">The resource builder.</param>
+    /// <param name="certificateBundleEnvironmentVariable">The environment variable that receives the certificate bundle path.</param>
+    /// <param name="certificateDirectoriesEnvironmentVariable">The optional environment variable that receives the certificate directories path.</param>
+    /// <returns>The updated resource builder.</returns>
+    /// <ats-returns>The resource builder.</ats-returns>
+    [AspireExport]
+    internal static IResourceBuilder<TResource> WithCertificateTrustEnvironment<TResource>(
+        this IResourceBuilder<TResource> builder,
+        string certificateBundleEnvironmentVariable,
+        string? certificateDirectoriesEnvironmentVariable = null)
+        where TResource : IResourceWithArgs, IResourceWithEnvironment
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(certificateBundleEnvironmentVariable);
+
+        if (certificateDirectoriesEnvironmentVariable is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(certificateDirectoriesEnvironmentVariable);
+        }
+
+        return builder.WithCertificateTrustConfiguration(context =>
+        {
+            context.EnvironmentVariables[certificateBundleEnvironmentVariable] = context.CertificateBundlePath;
+
+            if (certificateDirectoriesEnvironmentVariable is not null)
+            {
+                context.EnvironmentVariables[certificateDirectoriesEnvironmentVariable] = context.CertificateDirectoriesPath;
+            }
+
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>
     /// Indicates that a resource should use the developer certificate key pair for HTTPS endpoints at run time.
     /// Currently this indicates use of the ASP.NET Core developer certificate. The developer certificate will only be used
     /// when running in local development scenarios; in publish mode resources will use their default certificate configuration.
@@ -4818,6 +4929,44 @@ public static class ResourceBuilderExtensions
     }
 
     /// <summary>
+    /// Adds VS Code-compatible debug metadata for an executable resource.
+    /// </summary>
+    /// <typeparam name="T">The resource type.</typeparam>
+    /// <param name="builder">The resource builder.</param>
+    /// <param name="launchConfigurationType">The launch configuration type understood by the extension.</param>
+    /// <param name="scriptPath">The script path, relative to the executable working directory when not rooted.</param>
+    /// <param name="runtimeExecutable">The optional runtime executable to use in the launch configuration.</param>
+    /// <param name="launchMethod">The optional launch method to use in the launch configuration.</param>
+    /// <returns>The resource builder.</returns>
+    /// <ats-returns>The resource builder.</ats-returns>
+    [AspireExport]
+    internal static IResourceBuilder<T> WithExecutableDebugSupport<T>(
+        this IResourceBuilder<T> builder,
+        string launchConfigurationType,
+        string scriptPath,
+        string? runtimeExecutable = null,
+        string? launchMethod = null)
+        where T : ExecutableResource
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        ArgumentException.ThrowIfNullOrWhiteSpace(launchConfigurationType);
+        ArgumentException.ThrowIfNullOrWhiteSpace(scriptPath);
+
+        var workingDirectory = Path.GetFullPath(builder.Resource.WorkingDirectory);
+
+        return builder.WithDebugSupport(
+            mode => new AtsExecutableLaunchConfiguration(launchConfigurationType)
+            {
+                Mode = mode,
+                ScriptPath = Path.GetFullPath(scriptPath, workingDirectory),
+                RuntimeExecutable = runtimeExecutable ?? launchConfigurationType,
+                WorkingDirectory = workingDirectory,
+                LaunchMethod = launchMethod ?? "direct"
+            },
+            launchConfigurationType);
+    }
+
+    /// <summary>
     /// Adds a HTTP probe to the resource.
     /// </summary>
     /// <typeparam name="T">Type of resource.</typeparam>
@@ -5217,5 +5366,26 @@ public static class ResourceBuilderExtensions
         {
             context.Options.RemoteImageTag = remoteImageTag;
         });
+    }
+
+    private sealed class AtsExecutableLaunchConfiguration(string type)
+    {
+        [JsonPropertyName("type")]
+        public string Type { get; } = type;
+
+        [JsonPropertyName("mode")]
+        public string Mode { get; init; } = string.Empty;
+
+        [JsonPropertyName("script_path")]
+        public string ScriptPath { get; init; } = string.Empty;
+
+        [JsonPropertyName("runtime_executable")]
+        public string RuntimeExecutable { get; init; } = string.Empty;
+
+        [JsonPropertyName("working_directory")]
+        public string WorkingDirectory { get; init; } = string.Empty;
+
+        [JsonPropertyName("launch_method")]
+        public string LaunchMethod { get; init; } = string.Empty;
     }
 }

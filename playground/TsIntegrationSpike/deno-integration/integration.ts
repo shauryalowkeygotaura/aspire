@@ -5,6 +5,7 @@ import type {
     DistributedApplicationBuilder,
     DockerfileBuilderCallbackContext,
     ExecutableResource,
+    Resource,
 } from '../.modules/aspire.js';
 import {
     AspireExport,
@@ -14,6 +15,7 @@ import {
 
 const defaultDenoImage = 'denoland/deno:alpine-2.5.6';
 const defaultPermissions = ['--allow-net', '--allow-env'];
+const denoStateMetadataName = 'spike.deno/state';
 
 const builderType: AspireTypeRef = {
     typeId: 'Aspire.Hosting/Aspire.Hosting.IDistributedApplicationBuilder',
@@ -111,16 +113,34 @@ interface DenoAppState
     appDirectory: string;
     scriptPath: string;
     args: string[];
+    argsConfigured: boolean;
     permissions: string[];
+    permissionsConfigured: boolean;
     runTask?: string;
     runTaskArgs: string[];
     buildTask?: string;
     buildTaskArgs: string[];
     runtimeImage: string;
     buildImage: string;
+    dockerfileBaseImageConfigured: boolean;
 }
 
-const stateByResource = new Map<string, DenoAppState>();
+interface IntegrationMetadataReader
+{
+    getIntegrationMetadata(name: string): Promise<string>;
+}
+
+interface IntegrationMetadataWriter extends IntegrationMetadataReader
+{
+    withIntegrationMetadata(name: string, value: string): PromiseLike<unknown>;
+}
+
+interface DenoDockerfileState extends DenoAppState
+{
+    cache: boolean;
+    port?: number;
+    user?: string;
+}
 
 export const addDenoApp = AspireExport<AddDenoAppArgs, ExecutableResource>(
     {
@@ -155,21 +175,30 @@ export const addDenoApp = AspireExport<AddDenoAppArgs, ExecutableResource>(
             appHostDirectory,
             appDirectory,
             scriptPath,
-            args,
+            args: [...args],
+            argsConfigured: args.length > 0,
             permissions: [...defaultPermissions],
+            permissionsConfigured: false,
             runTaskArgs: [],
             buildTaskArgs: [],
             runtimeImage: defaultDenoImage,
             buildImage: defaultDenoImage,
+            dockerfileBaseImageConfigured: false,
         };
 
-        const deno = await builder.addExecutable(name, 'deno', appDirectory, getRunArgs(state));
+        const deno = await builder.addExecutable(name, 'deno', appDirectory, []);
         await deno.withRequiredCommand('deno', { helpLink: 'https://docs.deno.com/runtime/getting_started/installation/' });
         await deno.withOtlpExporter();
         await deno.withIconName('CodeJsRectangle');
         await deno.withEnvironment('DENO_ENV', 'development');
-
-        setState(deno, state);
+        await deno.withDeveloperCertificateTrust(true);
+        await deno.withCertificateTrustEnvironment('DENO_CERT');
+        await deno.withExecutableDebugSupport('deno', scriptPath, {
+            runtimeExecutable: 'deno',
+            launchMethod: 'direct',
+        });
+        await writeState(deno, state);
+        await deno.withArgsCallback(configureDenoRunArgs);
 
         console.log(`[@spike/aspire-deno] addDenoApp('${name}') complete`);
         return deno;
@@ -194,9 +223,10 @@ export const withDenoArgs = AspireExport<WithDenoArgsArgs, ExecutableResource>(
         },
     },
     async ({ resource, args }) => {
-        const state = getState(resource);
-        state.args = args;
-        await updateRunCommand(resource, state);
+        const state = await readState(resource);
+        state.args = [...args];
+        state.argsConfigured = true;
+        await writeState(resource, state);
 
         return resource;
     }
@@ -220,9 +250,10 @@ export const withDenoPermissions = AspireExport<WithDenoPermissionsArgs, Executa
         },
     },
     async ({ resource, permissions }) => {
-        const state = getState(resource);
+        const state = await readState(resource);
         state.permissions = permissions.map(normalizePermission);
-        await updateRunCommand(resource, state);
+        state.permissionsConfigured = true;
+        await writeState(resource, state);
 
         return resource;
     }
@@ -247,10 +278,10 @@ export const withDenoTask = AspireExport<WithDenoTaskArgs, ExecutableResource>(
         },
     },
     async ({ resource, taskName, args = [] }) => {
-        const state = getState(resource);
+        const state = await readState(resource);
         state.runTask = taskName;
-        state.runTaskArgs = args;
-        await updateRunCommand(resource, state);
+        state.runTaskArgs = [...args];
+        await writeState(resource, state);
 
         return resource;
     }
@@ -275,9 +306,10 @@ export const withDenoBuildTask = AspireExport<WithDenoBuildTaskArgs, ExecutableR
         },
     },
     async ({ resource, taskName, args = [] }) => {
-        const state = getState(resource);
+        const state = await readState(resource);
         state.buildTask = taskName;
-        state.buildTaskArgs = args;
+        state.buildTaskArgs = [...args];
+        await writeState(resource, state);
 
         return resource;
     }
@@ -302,9 +334,11 @@ export const withDenoDockerfileBaseImage = AspireExport<WithDenoDockerfileBaseIm
         },
     },
     async ({ resource, runtimeImage, buildImage }) => {
-        const state = getState(resource);
+        const state = await readState(resource);
         state.runtimeImage = runtimeImage ?? state.runtimeImage;
         state.buildImage = buildImage ?? runtimeImage ?? state.buildImage;
+        state.dockerfileBaseImageConfigured ||= runtimeImage !== undefined || buildImage !== undefined;
+        await writeState(resource, state);
 
         return resource;
     }
@@ -337,14 +371,31 @@ export const publishAsDenoDockerFile = AspireExport<PublishAsDenoDockerFileArgs,
         },
     },
     async ({ resource, ...options }) => {
-        const state = getState(resource);
+        const state = await readState(resource);
         const fullAppDirectory = path.resolve(state.appHostDirectory, state.appDirectory);
         const dockerfilePath = options.dockerfilePath ?? 'Dockerfile';
         const existingDockerfilePath = path.resolve(fullAppDirectory, dockerfilePath);
         const useExistingDockerfile = options.useExistingDockerfile ?? existsSync(existingDockerfilePath);
 
+        if (useExistingDockerfile) {
+            validateExistingDockerfileOptions(state, options, dockerfilePath);
+        }
+
+        const dockerfileState: DenoDockerfileState = {
+            ...state,
+            runtimeImage: options.runtimeImage ?? state.runtimeImage,
+            buildImage: options.buildImage ?? options.runtimeImage ?? state.buildImage,
+            buildTask: options.buildTask ?? state.buildTask,
+            buildTaskArgs: options.buildArgs !== undefined ? [...options.buildArgs] : [...state.buildTaskArgs],
+            cache: options.cache ?? true,
+            port: options.port,
+            user: options.user,
+        };
+
         await resource.publishAsDockerFile(async (container: ContainerResource) => {
             await container.withEnvironment('DENO_ENV', 'production');
+            await container.withCertificateTrustEnvironment('DENO_CERT');
+            await writeState(container, dockerfileState);
 
             if (useExistingDockerfile) {
                 await container.withDockerfile(state.appDirectory, {
@@ -356,7 +407,7 @@ export const publishAsDenoDockerFile = AspireExport<PublishAsDenoDockerFileArgs,
 
             await container.withDockerfileBuilder(
                 state.appDirectory,
-                async context => configureGeneratedDockerfile(context, state, options),
+                configureGeneratedDockerfile,
                 { stage: options.stage ?? 'runtime' });
         });
 
@@ -365,51 +416,54 @@ export const publishAsDenoDockerFile = AspireExport<PublishAsDenoDockerFileArgs,
 );
 
 async function configureGeneratedDockerfile(
-    context: DockerfileBuilderCallbackContext,
-    state: DenoAppState,
-    options: Omit<PublishAsDenoDockerFileArgs, 'resource'>): Promise<void>
+    context: DockerfileBuilderCallbackContext): Promise<void>
 {
     const dockerfile = await context.builder();
     const container = await context.resource();
-    const buildImage = options.buildImage ?? state.buildImage;
-    const runtimeImage = options.runtimeImage ?? state.runtimeImage;
-    const buildTask = options.buildTask ?? state.buildTask;
-    const buildArgs = options.buildArgs ?? state.buildTaskArgs;
+    const state = await readDockerfileState(container);
 
     await dockerfile.addContainerFilesStages(container);
 
-    const build = await dockerfile.from(buildImage, { stageName: 'build' });
+    const build = await dockerfile.from(state.buildImage, { stageName: 'build' });
     await build
         .workDir('/app')
         .copy('.', '.', { chown: 'deno:deno' });
 
-    if (options.cache ?? true) {
+    if (state.cache) {
         await build.run(shellJoin(['deno', 'cache', ...state.permissions, state.scriptPath]));
     }
 
-    if (buildTask) {
-        await build.run(shellJoin(['deno', 'task', buildTask, ...buildArgs]));
+    if (state.buildTask) {
+        await build.run(shellJoin(['deno', 'task', state.buildTask, ...state.buildTaskArgs]));
     }
 
-    const runtime = await dockerfile.from(runtimeImage, { stageName: 'runtime' });
+    const runtime = await dockerfile.from(state.runtimeImage, { stageName: 'runtime' });
     await runtime
         .workDir('/app')
         .copyFrom('build', '/app', '/app', { chown: 'deno:deno' })
         .env('DENO_ENV', 'production');
 
-    if (options.port !== undefined) {
-        await runtime.expose(options.port);
+    if (state.port !== undefined) {
+        await runtime.expose(state.port);
     }
 
     await runtime
-        .user(options.user ?? 'deno')
+        .user(state.user ?? 'deno')
         .entrypoint(['deno', ...getRunArgs(state)])
         .addContainerFiles(container, '/app');
 }
 
-async function updateRunCommand(resource: ExecutableResource, state: DenoAppState): Promise<void>
+async function configureDenoRunArgs(context: { args(): PromiseLike<{ clear(): PromiseLike<unknown>; add(value: string): PromiseLike<unknown> }>; resource(): PromiseLike<Resource> }): Promise<void>
 {
-    await resource.withArgsReplace(getRunArgs(state));
+    const resource = await context.resource();
+    const state = await readState(resource);
+    const args = await context.args();
+
+    await args.clear();
+
+    for (const arg of getRunArgs(state)) {
+        await args.add(arg);
+    }
 }
 
 function getRunArgs(state: DenoAppState): string[]
@@ -421,25 +475,84 @@ function getRunArgs(state: DenoAppState): string[]
     return ['run', ...state.permissions, state.scriptPath, ...state.args];
 }
 
-function setState(resource: ExecutableResource, state: DenoAppState): void
+async function readState(resource: IntegrationMetadataReader): Promise<DenoAppState>
 {
-    stateByResource.set(resourceKey(resource), state);
-}
+    const serialized = await resource.getIntegrationMetadata(denoStateMetadataName);
+    const state = JSON.parse(serialized) as DenoAppState;
 
-function getState(resource: ExecutableResource): DenoAppState
-{
-    const state = stateByResource.get(resourceKey(resource));
-    if (!state) {
-        throw new Error('This resource was not created by addDenoApp.');
-    }
+    state.args ??= [];
+    state.argsConfigured ??= state.args.length > 0;
+    state.permissions ??= [...defaultPermissions];
+    state.permissionsConfigured ??= false;
+    state.runTaskArgs ??= [];
+    state.buildTaskArgs ??= [];
+    state.runtimeImage ??= defaultDenoImage;
+    state.buildImage ??= state.runtimeImage;
+    state.dockerfileBaseImageConfigured ??= false;
 
     return state;
 }
 
-function resourceKey(resource: ExecutableResource): string
+async function readDockerfileState(resource: IntegrationMetadataReader): Promise<DenoDockerfileState>
 {
-    const handle = resource.toJSON();
-    return `${handle.$type}:${handle.$handle}`;
+    const state = await readState(resource) as DenoDockerfileState;
+    state.cache ??= true;
+
+    return state;
+}
+
+async function writeState(resource: IntegrationMetadataWriter, state: DenoAppState): Promise<void>
+{
+    await resource.withIntegrationMetadata(denoStateMetadataName, JSON.stringify(state));
+}
+
+function validateExistingDockerfileOptions(
+    state: DenoAppState,
+    options: Omit<PublishAsDenoDockerFileArgs, 'resource'>,
+    dockerfilePath: string): void
+{
+    const ignoredOptions: string[] = [];
+
+    if (state.argsConfigured) {
+        ignoredOptions.push('Deno script arguments');
+    }
+
+    if (state.permissionsConfigured) {
+        ignoredOptions.push('Deno permissions');
+    }
+
+    if (state.runTask) {
+        ignoredOptions.push(`run task '${state.runTask}'`);
+    }
+
+    if (state.buildTask || options.buildTask !== undefined || options.buildArgs !== undefined) {
+        ignoredOptions.push('Deno build task');
+    }
+
+    if (state.dockerfileBaseImageConfigured || options.runtimeImage !== undefined || options.buildImage !== undefined) {
+        ignoredOptions.push('Deno Dockerfile base images');
+    }
+
+    if (options.cache !== undefined) {
+        ignoredOptions.push('Deno cache layer');
+    }
+
+    if (options.port !== undefined) {
+        ignoredOptions.push('Dockerfile exposed port');
+    }
+
+    if (options.user !== undefined) {
+        ignoredOptions.push('Dockerfile runtime user');
+    }
+
+    if (ignoredOptions.length === 0) {
+        return;
+    }
+
+    throw new Error(
+        `Deno app '${state.appDirectory}' is publishing with existing Dockerfile '${dockerfilePath}', ` +
+        `so Aspire cannot apply ${ignoredOptions.join(', ')}. Remove or rename the Dockerfile so Aspire can generate one, ` +
+        'or configure the Dockerfile directly.');
 }
 
 function normalizePermission(permission: string): string
