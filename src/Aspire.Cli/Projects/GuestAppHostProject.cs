@@ -278,32 +278,50 @@ internal sealed class GuestAppHostProject : IAppHostProject, IGuestAppHostSdkGen
             return false;
         }
 
-        // Step 3: Start the AppHost server temporarily for code generation
-        await using var serverSession = AppHostServerSession.Start(
-            appHostServerProject,
-            environmentVariables: null,
-            debug: false,
-            _logger,
-            _profilingTelemetry);
+        var hasNpmIntegrationHosts = integrations.Any(integration => integration.Source == IntegrationSource.Npm);
 
-        // Step 4: Connect to server
-        var rpcClient = await serverSession.GetRpcClientAsync(cancellationToken);
-
-        // Step 5: Generate SDK code via RPC
+        // Step 3: Generate SDK code via RPC.
         // This must happen before guest AppHost dependency installation because the
         // generated code directory (.aspire/modules) may not exist yet and dependency
         // files reference it.
-        await GenerateCodeViaRpcAsync(
-            directory.FullName,
-            appHostFile: null,
-            rpcClient,
-            integrations,
-            cancellationToken);
+        await GenerateSdkCodeUsingAppHostServerAsync(installDependencies: !hasNpmIntegrationHosts);
 
-        // Step 6: Install dependencies using GuestRuntime (best effort - don't block code generation)
-        await InstallDependenciesAsync(directory, rpcClient, treatMissingJavaScriptToolAsWarning: true, cancellationToken: cancellationToken);
+        if (hasNpmIntegrationHosts)
+        {
+            // npm integration hosts are themselves TypeScript programs that import the
+            // generated .modules SDK in order to call ATS primitives. On a clean restore
+            // there is no SDK yet, so the first pass bootstraps the core SDK. Restart the
+            // server and generate again so those hosts can start and contribute their
+            // external capabilities before the apphost is type-checked.
+            _logger.LogDebug("Regenerating SDK after bootstrapping npm integration host dependencies.");
+            await GenerateSdkCodeUsingAppHostServerAsync(installDependencies: true);
+        }
 
         return true;
+
+        async Task GenerateSdkCodeUsingAppHostServerAsync(bool installDependencies)
+        {
+            await using var serverSession = AppHostServerSession.Start(
+                appHostServerProject,
+                environmentVariables: null,
+                debug: false,
+                _logger,
+                _profilingTelemetry);
+
+            var rpcClient = await serverSession.GetRpcClientAsync(cancellationToken);
+
+            await GenerateCodeViaRpcAsync(
+                directory.FullName,
+                appHostFile: null,
+                rpcClient,
+                integrations,
+                cancellationToken);
+
+            if (installDependencies)
+            {
+                await InstallDependenciesAsync(directory, rpcClient, treatMissingJavaScriptToolAsWarning: true, cancellationToken: cancellationToken);
+            }
+        }
     }
 
     Task<bool> IGuestAppHostSdkGenerator.BuildAndGenerateSdkAsync(DirectoryInfo directory, string? packageSourceOverride, CancellationToken cancellationToken)

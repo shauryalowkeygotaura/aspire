@@ -11,8 +11,8 @@ import {
 // registry with factories for every type in the generated SDK. Without this
 // import `wrapIfHandle` would return bare Handle instances with no methods.
 import '../.modules/aspire.js';
-import type { DistributedApplicationBuilder } from '../.modules/aspire.js';
 import {
+    invokeRegisteredCallback,
     getAspireExport,
     type AspireExportedFunction,
     type AspireExportMetadata,
@@ -82,16 +82,6 @@ export async function runIntegrationHost(host: IntegrationHostDefinition): Promi
     connection.onClose(() => {
         log("Connection closed");
     });
-    connection.listen();
-
-    const authToken = process.env.ASPIRE_REMOTE_APPHOST_TOKEN;
-    if (authToken) {
-        const authenticated = await connection.sendRequest<boolean>('authenticate', authToken);
-        log(`Authenticated: ${authenticated}`);
-    }
-
-    const ping = await connection.sendRequest<string>('ping');
-    log(`Ping: ${ping}`);
 
     // Raw invokeCapability — used by both the generated lib (through AspireClientRpc)
     // and the callback relay.
@@ -151,6 +141,20 @@ export async function runIntegrationHost(host: IntegrationHostDefinition): Promi
         throwOnPendingRejections: true,
     };
 
+    connection.onRequest('invokeCallback', (callbackId: string, args: unknown) =>
+        invokeRegisteredCallback(callbackId, args, client));
+
+    connection.listen();
+
+    const authToken = process.env.ASPIRE_REMOTE_APPHOST_TOKEN;
+    if (authToken) {
+        const authenticated = await connection.sendRequest<boolean>('authenticate', authToken);
+        log(`Authenticated: ${authenticated}`);
+    }
+
+    const ping = await connection.sendRequest<string>('ping');
+    log(`Ping: ${ping}`);
+
     // Build a flat capability map keyed by capability id.
     const allCapabilities = host.integrations.flatMap(integration => integration.capabilities);
     const capabilityMap = new Map<string, AspireExportedFunction<any, any>>();
@@ -172,18 +176,7 @@ export async function runIntegrationHost(host: IntegrationHostDefinition): Promi
             }
             const meta = getAspireExport(fn)!;
 
-            const wrappedArgs: JsonObject = { ...(args ?? {}) };
-
-            // Upgrade any `builder`-named handle argument into a real
-            // DistributedApplicationBuilder instance via the handle-wrapper
-            // registry, so user code can call methods on it directly
-            // (builder.addContainer(...).withImageTag(...)...). The generated
-            // module already registers a factory for IDistributedApplicationBuilder,
-            // so wrapIfHandle returns the right typed wrapper — we do not need
-            // to import the private Impl class.
-            if (isRemoteHandle(wrappedArgs.builder)) {
-                wrappedArgs.builder = wrapIfHandle(wrappedArgs.builder, client) as DistributedApplicationBuilder;
-            }
+            const wrappedArgs = wrapRemoteValue({ ...(args ?? {}) }, client) as JsonObject;
 
             // For any parameter the projection marks as `isCallback`, replace
             // the wire-format callback id string with a JS function that routes
@@ -247,6 +240,28 @@ function isRemoteHandle(value: unknown): value is RemoteHandle
         && value !== null
         && '$handle' in value
         && '$type' in value;
+}
+
+function wrapRemoteValue(value: unknown, client: AspireClientRpc): unknown
+{
+    if (isRemoteHandle(value)) {
+        return wrapIfHandle(value, client);
+    }
+
+    if (Array.isArray(value)) {
+        return value.map(item => wrapRemoteValue(item, client));
+    }
+
+    if (typeof value === 'object' && value !== null) {
+        const result: JsonObject = {};
+        for (const [key, nestedValue] of Object.entries(value)) {
+            result[key] = wrapRemoteValue(nestedValue, client);
+        }
+
+        return result;
+    }
+
+    return value;
 }
 
 // Projection metadata types live in `../.modules/base.js` (AspireCapabilityProjection,

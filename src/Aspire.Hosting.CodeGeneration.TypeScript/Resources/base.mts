@@ -3,7 +3,7 @@ import { Handle, AspireClient, MarshalledHandle, CancellationToken, registerCanc
 import type { AspireClientRpc } from './transport.mjs';
 
 // Re-export transport types for convenience
-export { Handle, AspireClient, CapabilityError, CancellationToken, registerCallback, unregisterCallback, registerCancellation, unregisterCancellation } from './transport.mjs';
+export { Handle, AspireClient, CapabilityError, CancellationToken, invokeRegisteredCallback, registerCallback, unregisterCallback, registerCancellation, unregisterCancellation } from './transport.mjs';
 export type { MarshalledHandle, AtsError, AtsErrorDetails, CallbackFunction } from './transport.mjs';
 export { AtsErrorCodes, isMarshalledHandle, isAtsError, wrapIfHandle } from './transport.mjs';
 

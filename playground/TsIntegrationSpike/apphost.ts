@@ -24,7 +24,11 @@ console.log(`Added Kafka (from Node.js integration): ${JSON.stringify(kafka)}`);
 
 const deno = await builder
     .addDenoApp("deno-api", "./deno-api", "main.ts")
+    .withDenoPermissions(["net", "env"])
     .withDenoTask("serve")
+    .withDenoBuildTask("check")
+    .withDenoDockerfileBaseImage({ runtimeImage: "denoland/deno:alpine-2.5.6" })
+    .publishAsDenoDockerFile({ port: 8000, cache: true })
     .withHttpEndpoint({ env: "PORT" });
 
 console.log(`Added Deno API (from TypeScript integration): ${JSON.stringify(deno)}`);
