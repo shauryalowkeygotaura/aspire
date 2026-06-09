@@ -3752,9 +3752,23 @@ public class AzureEnvironmentResourceExtensionsTests
         Assert.Equal(expectedState, command.State);
     }
 
+    private static readonly TimeSpan s_testSynchronizationTimeout = TimeSpan.FromSeconds(30);
+
     private static async Task WaitForSignalBeforeOperationCompletesAsync(Task signalTask, Task operationTask, string completionMessage)
     {
-        var completedTask = await Task.WhenAny(signalTask, operationTask).ConfigureAwait(false);
+        using var watchdog = new CancellationTokenSource(s_testSynchronizationTimeout);
+        Task completedTask;
+
+        try
+        {
+            completedTask = await Task.WhenAny(signalTask, operationTask).WaitAsync(watchdog.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (watchdog.IsCancellationRequested)
+        {
+            Assert.Fail($"Timed out after {s_testSynchronizationTimeout} waiting for the test synchronization signal. Signal status: {signalTask.Status}. Operation status: {operationTask.Status}. {completionMessage}");
+            return;
+        }
+
         if (completedTask == signalTask || signalTask.IsCompleted)
         {
             await signalTask.ConfigureAwait(false);
@@ -3795,62 +3809,120 @@ public class AzureEnvironmentResourceExtensionsTests
 
     private sealed class TestDeploymentStateManager : IDeploymentStateManager
     {
+        private readonly object _lock = new();
         private readonly Dictionary<string, JsonObject> _sections = new(StringComparer.Ordinal);
 
         public string? StateFilePath => null;
 
         public Task<DeploymentStateSection> AcquireSectionAsync(string sectionName, CancellationToken cancellationToken = default)
         {
-            _sections.TryGetValue(sectionName, out var existingData);
-            var data = existingData?.DeepClone().AsObject() ?? [];
+            JsonObject data;
+            lock (_lock)
+            {
+                _sections.TryGetValue(sectionName, out var existingData);
+                data = existingData?.DeepClone().AsObject() ?? [];
+            }
 
             return Task.FromResult(new DeploymentStateSection(sectionName, data, version: 0));
         }
 
         public Task DeleteSectionAsync(DeploymentStateSection section, CancellationToken cancellationToken = default)
         {
-            _sections.Remove(section.SectionName);
+            lock (_lock)
+            {
+                _sections.Remove(section.SectionName);
+            }
+
             return Task.CompletedTask;
         }
 
         public Task SaveSectionAsync(DeploymentStateSection section, CancellationToken cancellationToken = default)
         {
-            _sections[section.SectionName] = section.Data.DeepClone().AsObject();
+            lock (_lock)
+            {
+                _sections[section.SectionName] = section.Data.DeepClone().AsObject();
+            }
+
             return Task.CompletedTask;
         }
 
         public Task ClearAllStateAsync(CancellationToken cancellationToken = default)
         {
-            _sections.Clear();
+            lock (_lock)
+            {
+                _sections.Clear();
+            }
+
             return Task.CompletedTask;
         }
     }
 
     private sealed class TestBicepProvisioner : IBicepProvisioner
     {
+        private readonly object _lock = new();
+        private readonly List<string> _configuredResources = [];
+        private readonly List<string> _provisionedResources = [];
+        private readonly Dictionary<string, string?> _provisionedLocations = new(StringComparer.Ordinal);
+
         public int ConfigureResourceCallCount { get; private set; }
 
         public int GetOrCreateResourceCallCount { get; private set; }
 
-        public List<string> ConfiguredResources { get; } = [];
+        public IReadOnlyList<string> ConfiguredResources
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return [.. _configuredResources];
+                }
+            }
+        }
 
-        public List<string> ProvisionedResources { get; } = [];
-        public Dictionary<string, string?> ProvisionedLocations { get; } = new(StringComparer.Ordinal);
+        public IReadOnlyList<string> ProvisionedResources
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return [.. _provisionedResources];
+                }
+            }
+        }
+
+        public IReadOnlyDictionary<string, string?> ProvisionedLocations
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return new Dictionary<string, string?>(_provisionedLocations, StringComparer.Ordinal);
+                }
+            }
+        }
 
         public Task<bool> ConfigureResourceAsync(AzureBicepResource resource, CancellationToken cancellationToken)
         {
-            ConfigureResourceCallCount++;
-            ConfiguredResources.Add(resource.Name);
+            lock (_lock)
+            {
+                ConfigureResourceCallCount++;
+                _configuredResources.Add(resource.Name);
+            }
+
             return Task.FromResult(false);
         }
 
         public Task GetOrCreateResourceAsync(AzureBicepResource resource, ProvisioningContext context, CancellationToken cancellationToken)
         {
-            GetOrCreateResourceCallCount++;
-            ProvisionedResources.Add(resource.Name);
-            ProvisionedLocations[resource.Name] = resource.Parameters.TryGetValue(AzureBicepResource.KnownParameters.Location, out var location)
-                ? location?.ToString()
-                : null;
+            lock (_lock)
+            {
+                GetOrCreateResourceCallCount++;
+                _provisionedResources.Add(resource.Name);
+                _provisionedLocations[resource.Name] = resource.Parameters.TryGetValue(AzureBicepResource.KnownParameters.Location, out var location)
+                    ? location?.ToString()
+                    : null;
+            }
+
             resource.Outputs["blobEndpoint"] = "https://storage.blob.core.windows.net/";
             return Task.CompletedTask;
         }
@@ -3901,16 +3973,34 @@ public class AzureEnvironmentResourceExtensionsTests
 
     private sealed class BlockingTestBicepProvisioner : IBicepProvisioner
     {
+        private readonly object _lock = new();
+        private readonly List<string> _provisionedResources = [];
+
         public TaskCompletionSource FirstProvisionStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource AllowFirstProvisionToComplete { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public List<string> ProvisionedResources { get; } = [];
+        public IReadOnlyList<string> ProvisionedResources
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return [.. _provisionedResources];
+                }
+            }
+        }
 
         public Task<bool> ConfigureResourceAsync(AzureBicepResource resource, CancellationToken cancellationToken) => Task.FromResult(false);
 
         public async Task GetOrCreateResourceAsync(AzureBicepResource resource, ProvisioningContext context, CancellationToken cancellationToken)
         {
-            ProvisionedResources.Add(resource.Name);
-            if (ProvisionedResources.Count == 1)
+            bool isFirstProvision;
+            lock (_lock)
+            {
+                _provisionedResources.Add(resource.Name);
+                isFirstProvision = _provisionedResources.Count == 1;
+            }
+
+            if (isFirstProvision)
             {
                 FirstProvisionStarted.TrySetResult();
                 await AllowFirstProvisionToComplete.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -4002,9 +4092,21 @@ public class AzureEnvironmentResourceExtensionsTests
 
     private sealed class BlockingDeleteArmClient : IArmClient
     {
+        private readonly object _lock = new();
+        private readonly List<string> _deletedResourceIds = [];
+
         public TaskCompletionSource DeleteStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource AllowDeleteToComplete { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public List<string> DeletedResourceIds { get; } = [];
+        public IReadOnlyList<string> DeletedResourceIds
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return [.. _deletedResourceIds];
+                }
+            }
+        }
 
         public Task<(ISubscriptionResource subscription, ITenantResource tenant)> GetSubscriptionAndTenantAsync(CancellationToken cancellationToken = default)
             => throw new NotSupportedException();
@@ -4032,7 +4134,11 @@ public class AzureEnvironmentResourceExtensionsTests
 
         public async Task DeleteResourceAsync(string resourceId, CancellationToken cancellationToken = default)
         {
-            DeletedResourceIds.Add(resourceId);
+            lock (_lock)
+            {
+                _deletedResourceIds.Add(resourceId);
+            }
+
             DeleteStarted.TrySetResult();
             await AllowDeleteToComplete.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
