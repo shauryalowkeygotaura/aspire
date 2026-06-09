@@ -931,7 +931,10 @@ public class AzureEnvironmentResourceExtensionsTests
 
         var provisioningTask = controller.EnsureProvisionedAsync(model, CancellationToken.None);
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            provisioningTask,
+            "Provisioning completed before the first resource started provisioning.");
         await notifications.PublishUpdateAsync(storage.Resource, state => state with { State = new("Creating ARM Deployment", KnownResourceStateStyles.Info) });
 
         Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var storageEvent));
@@ -1204,7 +1207,10 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await armClient.DeleteStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            armClient.DeleteStarted.Task,
+            commandTask,
+            "Delete command completed before the ARM delete operation started.");
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1432,7 +1438,10 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            commandTask,
+            "Reprovision command completed before provisioning started.");
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1505,7 +1514,10 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            commandTask,
+            "Reprovision command completed before provisioning started.");
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1574,7 +1586,10 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            storageTask,
+            "First reprovision command completed before provisioning started.");
 
         var storage2Task = reprovisionStorage2Command.ExecuteCommand(new ExecuteCommandContext
         {
@@ -1654,7 +1669,10 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = CreateArguments(("location", "westus2"))
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            commandTask,
+            "Change location command completed before provisioning started.");
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -3516,7 +3534,10 @@ public class AzureEnvironmentResourceExtensionsTests
 
         var reprovisionTask = controller.EnsureProvisionedAsync(model, CancellationToken.None);
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await WaitForSignalBeforeOperationCompletesAsync(
+            testBicepProvisioner.FirstProvisionStarted.Task,
+            reprovisionTask,
+            "Provisioning completed before the first resource started provisioning.");
         Assert.Equal(["storage"], testBicepProvisioner.ProvisionedResources);
 
         testBicepProvisioner.AllowFirstProvisionToComplete.TrySetResult();
@@ -3563,7 +3584,7 @@ public class AzureEnvironmentResourceExtensionsTests
         var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
         var controller = app.Services.GetRequiredService<AzureProvisioningController>();
 
-        await controller.EnsureProvisionedAsync(model).WaitAsync(TimeSpan.FromSeconds(30));
+        await controller.EnsureProvisionedAsync(model);
 
         Assert.True(notifications.TryGetCurrentState(storage.Name, out var storageEvent));
         Assert.Equal("Failed to Provision", storageEvent.Snapshot.State?.Text);
@@ -3729,6 +3750,23 @@ public class AzureEnvironmentResourceExtensionsTests
     {
         var command = Assert.Single(snapshot.Commands, c => c.Name == commandName);
         Assert.Equal(expectedState, command.State);
+    }
+
+    private static async Task WaitForSignalBeforeOperationCompletesAsync(Task signalTask, Task operationTask, string completionMessage)
+    {
+        var completedTask = await Task.WhenAny(signalTask, operationTask).ConfigureAwait(false);
+        if (completedTask == signalTask || signalTask.IsCompleted)
+        {
+            await signalTask.ConfigureAwait(false);
+            return;
+        }
+
+        if (operationTask.IsFaulted || operationTask.IsCanceled)
+        {
+            await operationTask.ConfigureAwait(false);
+        }
+
+        Assert.Fail(completionMessage);
     }
 
     private static async Task<(IReadOnlyList<PipelineStep> Steps, PipelineContext PipelineContext)> CreateAzureEnvironmentPipelineStepsAsync(
