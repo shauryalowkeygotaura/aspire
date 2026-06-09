@@ -654,6 +654,177 @@ public class AzureEnvironmentResourceExtensionsTests
     }
 
     [Fact]
+    public async Task GetAzureResourceCommand_ReturnsMissingResourceIdReasonWhenCachedStateHasNoOutputId()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+
+        builder.Configuration["Azure:SubscriptionId"] = "12345678-1234-1234-1234-123456789012";
+        builder.Configuration["Azure:Location"] = "westus2";
+        builder.Configuration["Azure:ResourceGroup"] = "test-rg";
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.AddAzureProvisioning();
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var preparer = new AzureResourcePreparer(
+            app.Services.GetRequiredService<IOptions<AzureProvisioningOptions>>(),
+            app.Services.GetRequiredService<DistributedApplicationExecutionContext>());
+
+        await preparer.OnBeforeStartAsync(new BeforeStartEvent(app.Services, model), CancellationToken.None);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = """{"blobEndpoint":{"value":"https://storage.blob.core.windows.net/"}}""";
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        var getResourceCommand = Assert.Single(storage.Resource.Annotations.OfType<ResourceCommandAnnotation>(), c => c.Name == AzureProvisioningController.GetAzureResourceCommandName);
+
+        var result = await getResourceCommand.ExecuteCommand(new ExecuteCommandContext
+        {
+            ServiceProvider = app.Services,
+            ResourceName = storage.Resource.Name,
+            CancellationToken = CancellationToken.None,
+            Logger = NullLogger.Instance,
+            Arguments = new InteractionInputCollection([])
+        });
+
+        Assert.True(result.Success);
+        Assert.True(result.Data!.DisplayImmediately);
+
+        var data = AssertCommandJsonData(result);
+        var deployment = Assert.IsType<JsonObject>(data["deployment"]);
+        Assert.True(deployment["hasState"]?.GetValue<bool>());
+        Assert.Null(deployment["resourceId"]);
+
+        var live = Assert.IsType<JsonObject>(data["live"]);
+        Assert.False(live["checked"]?.GetValue<bool>());
+        Assert.Null(live["exists"]);
+        Assert.Equal("missing-resource-id", live["reason"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task GetAzureResourceCommand_ReturnsStructuredRequestFailureWhenLiveProbeFails()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+        const string subscriptionId = "12345678-1234-1234-1234-123456789012";
+        const string resourceId = $"/subscriptions/{subscriptionId}/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/storage";
+
+        builder.Configuration["Azure:SubscriptionId"] = subscriptionId;
+        builder.Configuration["Azure:Location"] = "westus2";
+        builder.Configuration["Azure:ResourceGroup"] = "test-rg";
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.AddAzureProvisioning();
+        builder.Services.RemoveAll<IArmClientProvider>();
+        builder.Services.RemoveAll<ITokenCredentialProvider>();
+        builder.Services.AddSingleton<IArmClientProvider>(new ThrowingResourceProbeArmClientProvider(new RequestFailedException(403, "Forbidden", "AuthorizationFailed", null)));
+        builder.Services.AddSingleton<ITokenCredentialProvider>(ProvisioningTestHelpers.CreateTokenCredentialProvider());
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var preparer = new AzureResourcePreparer(
+            app.Services.GetRequiredService<IOptions<AzureProvisioningOptions>>(),
+            app.Services.GetRequiredService<DistributedApplicationExecutionContext>());
+
+        await preparer.OnBeforeStartAsync(new BeforeStartEvent(app.Services, model), CancellationToken.None);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = $$"""
+            {
+              "id": {
+                "value": "{{resourceId}}"
+              }
+            }
+            """;
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        var getResourceCommand = Assert.Single(storage.Resource.Annotations.OfType<ResourceCommandAnnotation>(), c => c.Name == AzureProvisioningController.GetAzureResourceCommandName);
+
+        var result = await getResourceCommand.ExecuteCommand(new ExecuteCommandContext
+        {
+            ServiceProvider = app.Services,
+            ResourceName = storage.Resource.Name,
+            CancellationToken = CancellationToken.None,
+            Logger = NullLogger.Instance,
+            Arguments = new InteractionInputCollection([])
+        });
+
+        Assert.True(result.Success);
+
+        var data = AssertCommandJsonData(result);
+        var live = Assert.IsType<JsonObject>(data["live"]);
+        Assert.True(live["checked"]?.GetValue<bool>());
+        Assert.Null(live["exists"]);
+        Assert.Equal("request-failed", live["reason"]?.GetValue<string>());
+        Assert.Equal(403, live["status"]?.GetValue<int>());
+        Assert.Equal("AuthorizationFailed", live["errorCode"]?.GetValue<string>());
+        Assert.Contains("Forbidden", live["message"]?.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetAzureResourceCommand_ReturnsCredentialUnavailableReasonWhenLiveProbeCannotAuthenticate()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+        const string subscriptionId = "12345678-1234-1234-1234-123456789012";
+        const string resourceId = $"/subscriptions/{subscriptionId}/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/storage";
+
+        builder.Configuration["Azure:SubscriptionId"] = subscriptionId;
+        builder.Configuration["Azure:Location"] = "westus2";
+        builder.Configuration["Azure:ResourceGroup"] = "test-rg";
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.Services.AddSingleton<IArmClientProvider, CredentialUnavailableArmClientProvider>();
+        builder.AddAzureProvisioning();
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var preparer = new AzureResourcePreparer(
+            app.Services.GetRequiredService<IOptions<AzureProvisioningOptions>>(),
+            app.Services.GetRequiredService<DistributedApplicationExecutionContext>());
+
+        await preparer.OnBeforeStartAsync(new BeforeStartEvent(app.Services, model), CancellationToken.None);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = $$"""
+            {
+              "id": {
+                "value": "{{resourceId}}"
+              }
+            }
+            """;
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        var getResourceCommand = Assert.Single(storage.Resource.Annotations.OfType<ResourceCommandAnnotation>(), c => c.Name == AzureProvisioningController.GetAzureResourceCommandName);
+
+        var result = await getResourceCommand.ExecuteCommand(new ExecuteCommandContext
+        {
+            ServiceProvider = app.Services,
+            ResourceName = storage.Resource.Name,
+            CancellationToken = CancellationToken.None,
+            Logger = NullLogger.Instance,
+            Arguments = new InteractionInputCollection([])
+        });
+
+        Assert.True(result.Success);
+
+        var data = AssertCommandJsonData(result);
+        var live = Assert.IsType<JsonObject>(data["live"]);
+        Assert.True(live["checked"]?.GetValue<bool>());
+        Assert.Null(live["exists"]);
+        Assert.Equal("credential-unavailable", live["reason"]?.GetValue<string>());
+        Assert.Contains("Credential unavailable", live["message"]?.GetValue<string>(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CancelDeploymentCommand_CancelsCachedDeploymentAndMarksStateCanceled()
     {
         var builder = CreateBuilder(isRunMode: true);
@@ -2499,6 +2670,163 @@ public class AzureEnvironmentResourceExtensionsTests
         Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var resourceEvent));
         Assert.Equal(AzureProvisioningController.MissingInAzureState, resourceEvent.Snapshot.State?.Text);
         Assert.Equal(KnownResourceStateStyles.Error, resourceEvent.Snapshot.State?.Style);
+    }
+
+    [Fact]
+    public async Task CheckForDriftAsync_LeavesRunningResourcesWhenAzureResourcesStillExist()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+        const string resourceId = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/storage";
+
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.Services.AddSingleton<IArmClientProvider>(ProvisioningTestHelpers.CreateArmClientProvider([resourceId]));
+        builder.Services.AddSingleton<ITokenCredentialProvider>(ProvisioningTestHelpers.CreateTokenCredentialProvider());
+        builder.AddAzureProvisioning();
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
+        var environmentResource = Assert.Single(model.Resources.OfType<AzureEnvironmentResource>());
+        var controller = app.Services.GetRequiredService<AzureProvisioningController>();
+
+        var azureSection = await deploymentStateManager.AcquireSectionAsync("Azure");
+        azureSection.Data["SubscriptionId"] = "12345678-1234-1234-1234-123456789012";
+        azureSection.Data["Location"] = "westus2";
+        azureSection.Data["ResourceGroup"] = "test-rg";
+        await deploymentStateManager.SaveSectionAsync(azureSection);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = $$"""
+            {
+              "id": {
+                "value": "{{resourceId}}"
+              }
+            }
+            """;
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        await notifications.PublishUpdateAsync(environmentResource, state => state with { State = KnownResourceStates.Running });
+        await notifications.PublishUpdateAsync(storage.Resource, state => state with { State = KnownResourceStates.Running });
+
+        await controller.CheckForDriftAsync(model);
+
+        Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
+        Assert.Equal(KnownResourceStates.Running, environmentEvent.Snapshot.State?.Text);
+
+        Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var resourceEvent));
+        Assert.Equal(KnownResourceStates.Running, resourceEvent.Snapshot.State?.Text);
+    }
+
+    [Fact]
+    public async Task CheckForDriftAsync_MarksOnlyMissingResourceWhenOtherAzureResourcesStillExist()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+        const string existingResourceId = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/storage";
+        const string missingResourceId = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/test-rg/providers/Microsoft.Storage/storageAccounts/storage2";
+
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.Services.AddSingleton<IArmClientProvider>(ProvisioningTestHelpers.CreateArmClientProvider([existingResourceId]));
+        builder.Services.AddSingleton<ITokenCredentialProvider>(ProvisioningTestHelpers.CreateTokenCredentialProvider());
+        builder.AddAzureProvisioning();
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+        var storage2 = builder.AddBicepTemplateString("storage2", "resource storage2 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
+        var environmentResource = Assert.Single(model.Resources.OfType<AzureEnvironmentResource>());
+        var controller = app.Services.GetRequiredService<AzureProvisioningController>();
+
+        var azureSection = await deploymentStateManager.AcquireSectionAsync("Azure");
+        azureSection.Data["SubscriptionId"] = "12345678-1234-1234-1234-123456789012";
+        azureSection.Data["Location"] = "westus2";
+        azureSection.Data["ResourceGroup"] = "test-rg";
+        await deploymentStateManager.SaveSectionAsync(azureSection);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = $$"""
+            {
+              "id": {
+                "value": "{{existingResourceId}}"
+              }
+            }
+            """;
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        var storage2Section = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage2");
+        storage2Section.Data["Outputs"] = $$"""
+            {
+              "id": {
+                "value": "{{missingResourceId}}"
+              }
+            }
+            """;
+        await deploymentStateManager.SaveSectionAsync(storage2Section);
+
+        await notifications.PublishUpdateAsync(environmentResource, state => state with { State = KnownResourceStates.Running });
+        await notifications.PublishUpdateAsync(storage.Resource, state => state with { State = KnownResourceStates.Running });
+        await notifications.PublishUpdateAsync(storage2.Resource, state => state with { State = KnownResourceStates.Running });
+
+        await controller.CheckForDriftAsync(model);
+
+        Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
+        Assert.Equal(AzureProvisioningController.DriftedState, environmentEvent.Snapshot.State?.Text);
+
+        Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var storageEvent));
+        Assert.Equal(KnownResourceStates.Running, storageEvent.Snapshot.State?.Text);
+
+        Assert.True(notifications.TryGetCurrentState(storage2.Resource.Name, out var storage2Event));
+        Assert.Equal(AzureProvisioningController.MissingInAzureState, storage2Event.Snapshot.State?.Text);
+        Assert.Equal(KnownResourceStateStyles.Error, storage2Event.Snapshot.State?.Style);
+    }
+
+    [Fact]
+    public async Task CheckForDriftAsync_SkipsResourcesWithoutCachedResourceIds()
+    {
+        var builder = CreateBuilder(isRunMode: true);
+        var deploymentStateManager = new TestDeploymentStateManager();
+
+        builder.Services.AddSingleton<IDeploymentStateManager>(deploymentStateManager);
+        builder.Services.AddSingleton<IArmClientProvider>(ProvisioningTestHelpers.CreateArmClientProvider(existingResourceIds: []));
+        builder.Services.AddSingleton<ITokenCredentialProvider>(ProvisioningTestHelpers.CreateTokenCredentialProvider());
+        builder.AddAzureProvisioning();
+
+        var storage = builder.AddBicepTemplateString("storage", "resource storage 'Microsoft.Storage/storageAccounts@2024-01-01' = {}");
+
+        using var app = builder.Build();
+
+        var model = app.Services.GetRequiredService<DistributedApplicationModel>();
+        var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
+        var environmentResource = Assert.Single(model.Resources.OfType<AzureEnvironmentResource>());
+        var controller = app.Services.GetRequiredService<AzureProvisioningController>();
+
+        var azureSection = await deploymentStateManager.AcquireSectionAsync("Azure");
+        azureSection.Data["SubscriptionId"] = "12345678-1234-1234-1234-123456789012";
+        azureSection.Data["Location"] = "westus2";
+        azureSection.Data["ResourceGroup"] = "test-rg";
+        await deploymentStateManager.SaveSectionAsync(azureSection);
+
+        var storageSection = await deploymentStateManager.AcquireSectionAsync("Azure:Deployments:storage");
+        storageSection.Data["Outputs"] = """{"blobEndpoint":{"value":"https://storage.blob.core.windows.net/"}}""";
+        await deploymentStateManager.SaveSectionAsync(storageSection);
+
+        await notifications.PublishUpdateAsync(environmentResource, state => state with { State = KnownResourceStates.Running });
+        await notifications.PublishUpdateAsync(storage.Resource, state => state with { State = KnownResourceStates.Running });
+
+        await controller.CheckForDriftAsync(model);
+
+        Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
+        Assert.Equal(KnownResourceStates.Running, environmentEvent.Snapshot.State?.Text);
+
+        Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var resourceEvent));
+        Assert.Equal(KnownResourceStates.Running, resourceEvent.Snapshot.State?.Text);
     }
 
     [Fact]
