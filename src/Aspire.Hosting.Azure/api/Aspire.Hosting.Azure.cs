@@ -125,6 +125,7 @@ namespace Aspire.Hosting
         [AspireExport]
         public static string GetBicepIdentifier(this ApplicationModel.IAzureResource resource) { throw null; }
 
+        [System.Obsolete("PublishAsConnectionString only works with the manifest publisher and is obsolete. Use AddConnectionString in publish-mode app model code instead.")]
         [AspireExport]
         public static ApplicationModel.IResourceBuilder<T> PublishAsConnectionString<T>(this ApplicationModel.IResourceBuilder<T> builder)
             where T : ApplicationModel.IAzureResource, ApplicationModel.IResourceWithConnectionString { throw null; }
