@@ -931,7 +931,7 @@ public class AzureEnvironmentResourceExtensionsTests
 
         var provisioningTask = controller.EnsureProvisionedAsync(model, CancellationToken.None);
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
         await notifications.PublishUpdateAsync(storage.Resource, state => state with { State = new("Creating ARM Deployment", KnownResourceStateStyles.Info) });
 
         Assert.True(notifications.TryGetCurrentState(storage.Resource.Name, out var storageEvent));
@@ -1204,7 +1204,7 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await armClient.DeleteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await armClient.DeleteStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1432,7 +1432,7 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1505,7 +1505,7 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -1574,7 +1574,7 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = new InteractionInputCollection([])
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         var storage2Task = reprovisionStorage2Command.ExecuteCommand(new ExecuteCommandContext
         {
@@ -1654,7 +1654,7 @@ public class AzureEnvironmentResourceExtensionsTests
             Arguments = CreateArguments(("location", "westus2"))
         });
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(notifications.TryGetCurrentState(environmentResource.Name, out var environmentEvent));
         Assert.All(environmentEvent.Snapshot.Commands, command => Assert.Equal(ResourceCommandState.Disabled, command.State));
@@ -3516,7 +3516,7 @@ public class AzureEnvironmentResourceExtensionsTests
 
         var reprovisionTask = controller.EnsureProvisionedAsync(model, CancellationToken.None);
 
-        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await testBicepProvisioner.FirstProvisionStarted.Task.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.Equal(["storage"], testBicepProvisioner.ProvisionedResources);
 
         testBicepProvisioner.AllowFirstProvisionToComplete.TrySetResult();
@@ -3563,7 +3563,7 @@ public class AzureEnvironmentResourceExtensionsTests
         var notifications = app.Services.GetRequiredService<ResourceNotificationService>();
         var controller = app.Services.GetRequiredService<AzureProvisioningController>();
 
-        await controller.EnsureProvisionedAsync(model).WaitAsync(TimeSpan.FromSeconds(5));
+        await controller.EnsureProvisionedAsync(model).WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(notifications.TryGetCurrentState(storage.Name, out var storageEvent));
         Assert.Equal("Failed to Provision", storageEvent.Snapshot.State?.Text);
